@@ -15,7 +15,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "drive_manager_ui.h"
-#include "chunker.h"
 #include "configuration.h"
 #include "crypto.h"
 #include "encoder.h"
@@ -36,11 +35,19 @@
 #include <QFileInfo>
 #include <QDateTime>
 #include <fstream>
+#include <filesystem>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+// Updated constructor to include container parameter
 WorkerThread::WorkerThread(Operation op, const QString& input, const QString& output,
-                         bool encrypt, const QString& password, QObject* parent)
+    bool encrypt, const QString& password, const QString& container, QObject* parent)
     : QThread(parent), operation(op), inputPath(input), outputPath(output),
-      encrypt(encrypt), password(password) {
+    encrypt(encrypt), password(password), container(container) {
 }
 
 void WorkerThread::run() {
@@ -50,46 +57,76 @@ void WorkerThread::run() {
         if (operation == Encode) {
             emit statusUpdated("Starting encoding process...");
             emit logMessage("Encoding: " + inputPath + " -> " + outputPath);
-            
-            if (!std::filesystem::exists(inputPath.toStdString())) {
+
+            const std::filesystem::path inputFsPath(inputPath.toStdWString());
+            if (!std::filesystem::exists(inputFsPath)) {
                 emit operationCompleted(false, "Input file does not exist");
                 return;
             }
-            
-            const auto input_size = std::filesystem::file_size(inputPath.toStdString());
+
+            const auto input_size = std::filesystem::file_size(inputFsPath);
             emit logMessage(QString("Input size: %1 bytes").arg(input_size));
-            
+
             emit progressUpdated(10);
-            const std::size_t chunk_size = encrypt ? CHUNK_SIZE_PLAIN_MAX_ENCRYPTED : 0;
-            const auto chunked = chunkFile(inputPath.toStdString().c_str(), chunk_size);
-            const std::size_t num_chunks = chunked.chunks.size();
+
+            // Read the entire input file using the wide path (handles Unicode filenames on Windows)
+            std::vector<std::byte> file_bytes;
+            {
+#ifdef _WIN32
+                std::ifstream ifs(inputFsPath.wstring(), std::ios::binary);
+#else
+                std::ifstream ifs(inputFsPath.string(), std::ios::binary);
+#endif
+                if (!ifs) {
+                    emit operationCompleted(false, "Failed to open input file");
+                    return;
+                }
+                file_bytes.resize(static_cast<std::size_t>(input_size));
+                ifs.read(reinterpret_cast<char*>(file_bytes.data()), static_cast<std::streamsize>(input_size));
+                if (!ifs && !ifs.eof()) {
+                    emit operationCompleted(false, "Failed to read input file");
+                    return;
+                }
+                file_bytes.resize(static_cast<std::size_t>(ifs.gcount()));
+            }
+
+            // Split into chunks manually, matching what chunkFile/chunkSpan would produce
+            const std::size_t effective_chunk_size =
+                (encrypt && CHUNK_SIZE_PLAIN_MAX_ENCRYPTED > 0)
+                ? CHUNK_SIZE_PLAIN_MAX_ENCRYPTED
+                : file_bytes.size(); // single chunk when not encrypting
+            const std::size_t num_chunks = file_bytes.empty() ? 1 :
+                (file_bytes.size() + effective_chunk_size - 1) / effective_chunk_size;
             emit logMessage(QString("Created %1 chunks").arg(num_chunks));
-            
+
             emit progressUpdated(30);
             if (encrypt) {
                 emit logMessage("Encrypting chunks with password");
             }
-            const std::array<std::byte, 16> file_id = []{
+            const std::array<std::byte, 16> file_id = [] {
                 std::array<std::byte, 16> id{};
                 for (int i = 0; i < 16; ++i) {
                     id[i] = static_cast<std::byte>(i);
                 }
                 return id;
-            }();
+                }();
             if (encrypt) {
                 const std::string pw = password.toStdString();
                 const std::span<const std::byte> pw_span(reinterpret_cast<const std::byte*>(pw.data()), pw.size());
                 key = derive_key(pw_span, file_id);
                 key_used = true;
             }
-            
+
             const Encoder encoder(file_id);
             std::vector<std::vector<Packet>> all_chunk_packets(num_chunks);
-            
+
             emit statusUpdated("Encoding chunks...");
 #pragma omp parallel for schedule(dynamic)
             for (int i = 0; i < static_cast<int>(num_chunks); ++i) {
-                auto chunk_data = chunkSpan(chunked, static_cast<std::size_t>(i));
+                const std::size_t offset = static_cast<std::size_t>(i) * effective_chunk_size;
+                const std::size_t remaining = file_bytes.size() > offset ? file_bytes.size() - offset : 0;
+                const std::size_t this_chunk_size = std::min(remaining, effective_chunk_size);
+                auto chunk_data = std::span<const std::byte>(file_bytes.data() + offset, this_chunk_size);
                 std::span<const std::byte> data_to_encode = chunk_data;
                 std::vector<std::byte> encrypted_buf;
                 if (encrypt) {
@@ -105,42 +142,44 @@ void WorkerThread::run() {
                     emit progressUpdated(progress);
                 }
             }
-            
+
             std::size_t total_packets = 0;
             for (const auto& packets : all_chunk_packets)
                 total_packets += packets.size();
             emit logMessage(QString("Generated %1 packets").arg(total_packets));
-            
+
             emit progressUpdated(90);
             emit statusUpdated("Creating video file...");
-            
-            VideoEncoder video_encoder(outputPath.toStdString());
+
+            VideoEncoder video_encoder(outputPath.toStdWString(), container.toStdString());
             for (auto& packets : all_chunk_packets) {
                 video_encoder.encode_packets(packets);
                 packets.clear();
                 packets.shrink_to_fit();
             }
             video_encoder.finalize();
-            
+
             if (encrypt) {
                 secure_zero(std::span<std::byte>(key));
             }
-            
+
             emit progressUpdated(100);
             emit operationCompleted(true, "Encoding completed successfully");
-            
-        } else if (operation == Decode) {
+
+        }
+        else if (operation == Decode) {
             emit statusUpdated("Starting decoding process...");
             emit logMessage("Decoding: " + inputPath + " -> " + outputPath);
-            
-            if (!std::filesystem::exists(inputPath.toStdString())) {
+
+            const std::filesystem::path inputFsPath(inputPath.toStdWString());
+            if (!std::filesystem::exists(inputFsPath)) {
                 emit operationCompleted(false, "Input video does not exist");
                 return;
             }
-            
-            const auto video_size = std::filesystem::file_size(inputPath.toStdString());
+
+            const auto video_size = std::filesystem::file_size(inputFsPath);
             emit logMessage(QString("Video size: %1 bytes").arg(video_size));
-            
+
             emit progressUpdated(10);
             Decoder decoder;
             std::size_t total_extracted = 0;
@@ -148,20 +187,20 @@ void WorkerThread::run() {
             uint32_t max_chunk_index = 0;
             bool found_last_chunk = false;
             uint32_t last_chunk_index = 0;
-            
-            VideoDecoder video_decoder(inputPath.toStdString());
+
+            VideoDecoder video_decoder(inputPath.toStdWString(), container.toStdString());
             const int64_t total_frames = video_decoder.total_frames();
             emit logMessage(QString("Total frames: %1").arg(total_frames >= 0 ? QString::number(total_frames) : "unknown"));
-            
+
             emit statusUpdated("Extracting packets from video...");
             std::size_t valid_frames = 0;
-            
+
             while (!video_decoder.is_eof()) {
                 if (auto frame_packets = video_decoder.decode_next_frame(); !frame_packets.empty()) {
                     ++valid_frames;
                     for (auto& pkt_data : frame_packets) {
                         ++total_extracted;
-                        
+
                         if (pkt_data.size() >= HEADER_SIZE) {
                             const auto flags = static_cast<uint8_t>(pkt_data[FLAGS_OFF]);
                             uint32_t chunk_idx = 0;
@@ -173,45 +212,46 @@ void WorkerThread::run() {
                                 last_chunk_index = chunk_idx;
                             }
                         }
-                        
+
                         const std::span<const std::byte> data(pkt_data.data(), pkt_data.size());
                         if (auto result = decoder.process_packet(data); result && result->success) {
                             ++decoded_chunks;
                         }
                     }
-                    
+
                     if (total_frames > 0) {
                         int progress = 10 + (70 * valid_frames / static_cast<int>(total_frames));
                         emit progressUpdated(progress);
                     }
                 }
             }
-            
+
             emit logMessage(QString("Valid frames: %1").arg(valid_frames));
             emit logMessage(QString("Packets extracted: %1").arg(total_extracted));
-            
+
             if (total_extracted == 0) {
                 emit operationCompleted(false, "No packets could be extracted from the video");
                 return;
             }
-            
+
             emit progressUpdated(80);
             emit statusUpdated("Assembling file...");
-            
+
             uint32_t expected_chunks;
             if (found_last_chunk) {
                 expected_chunks = last_chunk_index + 1;
-            } else {
+            }
+            else {
                 expected_chunks = max_chunk_index + 1;
             }
-            
+
             emit logMessage(QString("Chunks decoded: %1/%2").arg(decoded_chunks).arg(expected_chunks));
-            
+
             if (decoded_chunks < expected_chunks) {
                 emit operationCompleted(false, QString("Only decoded %1 of %2 chunks").arg(decoded_chunks).arg(expected_chunks));
                 return;
             }
-            
+
             if (decoder.is_encrypted()) {
                 emit logMessage("Decrypting content with password");
                 if (password.isEmpty()) {
@@ -224,7 +264,7 @@ void WorkerThread::run() {
                 decoder.set_decrypt_key(dec_key);
                 secure_zero(std::span<std::byte>(dec_key));
             }
-            
+
             auto assembled = decoder.assemble_file(expected_chunks);
             if (!assembled) {
                 if (decoder.is_encrypted()) {
@@ -233,24 +273,25 @@ void WorkerThread::run() {
                 emit operationCompleted(false, "Failed to assemble file (wrong password or corrupted data)");
                 return;
             }
-            
+
             if (decoder.is_encrypted()) {
                 decoder.clear_decrypt_key();
             }
-            
-            std::ofstream out(outputPath.toStdString(), std::ios::binary);
+
+            std::ofstream out(outputPath.toStdWString(), std::ios::binary);
             if (!out) {
                 emit operationCompleted(false, "Could not open output file for writing");
                 return;
             }
-            
+
             out.write(reinterpret_cast<const char*>(assembled->data()), static_cast<std::streamsize>(assembled->size()));
             out.close();
-            
+
             emit progressUpdated(100);
             emit operationCompleted(true, "Decoding completed successfully");
         }
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e) {
         if (key_used) {
             secure_zero(std::span<std::byte>(key));
         }
@@ -262,13 +303,22 @@ DriveManagerUI::DriveManagerUI(QWidget* parent)
     : QMainWindow(parent), isOperationRunning(false) {
     setWindowTitle("YouTube Media Storage - Drive Manager");
     setMinimumSize(1200, 800);
-    
+
     loadSettings();
+    loadRecentFiles();
     setupUI();
     setupMenuBar();
     setupStatusBar();
     connectSignals();
-    
+    setupRecentFilesMenu();
+
+    // Restore last used paths
+    QSettings settings;
+    inputFileEdit->setText(settings.value(SETTINGS_INPUT_FILE).toString());
+    outputFileEdit->setText(settings.value(SETTINGS_OUTPUT_FILE).toString());
+    batchOutputDirEdit->setText(settings.value(SETTINGS_BATCH_OUTPUT_DIR).toString());
+    encryptCheckBox->setChecked(settings.value(SETTINGS_ENCRYPT_CHECKED, false).toBool());
+
     resetProgress();
     logMessage("Drive Manager initialized");
 }
@@ -284,63 +334,79 @@ DriveManagerUI::~DriveManagerUI() {
 void DriveManagerUI::setupUI() {
     centralWidget = new QWidget(this);
     setCentralWidget(centralWidget);
-    
+
     mainSplitter = new QSplitter(Qt::Horizontal, centralWidget);
-    
+
     // Left panel
     QWidget* leftPanel = new QWidget();
     QVBoxLayout* leftLayout = new QVBoxLayout(leftPanel);
-    
+
     // File operations group
     fileOperationsGroup = new QGroupBox("File Operations");
     QGridLayout* fileOpsLayout = new QGridLayout(fileOperationsGroup);
-    
+
     fileOpsLayout->addWidget(new QLabel("Input File:"), 0, 0);
     inputFileEdit = new QLineEdit();
     inputFileEdit->setReadOnly(true);
     fileOpsLayout->addWidget(inputFileEdit, 0, 1);
-    
+
     selectInputButton = new QPushButton("Browse...");
     fileOpsLayout->addWidget(selectInputButton, 0, 2);
-    
+
     fileOpsLayout->addWidget(new QLabel("Output File:"), 1, 0);
     outputFileEdit = new QLineEdit();
     outputFileEdit->setReadOnly(true);
     fileOpsLayout->addWidget(outputFileEdit, 1, 1);
-    
+
     selectOutputButton = new QPushButton("Browse...");
     fileOpsLayout->addWidget(selectOutputButton, 1, 2);
-    
+
+    // Container selection row
+    fileOpsLayout->addWidget(new QLabel("Container:"), 2, 0);
+    containerCombo = new QComboBox();
+    containerCombo->addItem("Matroska (MKV)", "mkv");
+    containerCombo->addItem("MP4", "mp4");
+
+    // Load saved container preference
+    QSettings settings;
+    QString lastContainer = settings.value(SETTINGS_VIDEO_CONTAINER, "mkv").toString();
+    int index = containerCombo->findData(lastContainer);
+    if (index >= 0) {
+        containerCombo->setCurrentIndex(index);
+    }
+
+    fileOpsLayout->addWidget(containerCombo, 2, 1, 1, 2);
+
     encryptCheckBox = new QCheckBox("Encrypt with password");
-    fileOpsLayout->addWidget(encryptCheckBox, 2, 0, 1, 3);
-    
-    fileOpsLayout->addWidget(new QLabel("Password:"), 3, 0);
+    fileOpsLayout->addWidget(encryptCheckBox, 3, 0, 1, 3);
+
+    fileOpsLayout->addWidget(new QLabel("Password:"), 4, 0);
     passwordEdit = new QLineEdit();
     passwordEdit->setPlaceholderText("For encrypt or decrypt");
     passwordEdit->setEchoMode(QLineEdit::Password);
-    fileOpsLayout->addWidget(passwordEdit, 3, 1);
+    fileOpsLayout->addWidget(passwordEdit, 4, 1);
     passwordVisibilityButton = new QPushButton("Show");
     passwordVisibilityButton->setFixedWidth(selectInputButton->sizeHint().width());
-    fileOpsLayout->addWidget(passwordVisibilityButton, 3, 2);
-    
+    fileOpsLayout->addWidget(passwordVisibilityButton, 4, 2);
+
     encodeButton = new QPushButton("Encode to Video");
     encodeButton->setIcon(QIcon::fromTheme("media-record"));
-    fileOpsLayout->addWidget(encodeButton, 4, 0, 1, 3);
-    
+    fileOpsLayout->addWidget(encodeButton, 5, 0, 1, 3);
+
     decodeButton = new QPushButton("Decode from Video");
     decodeButton->setIcon(QIcon::fromTheme("media-playback-start"));
-    fileOpsLayout->addWidget(decodeButton, 5, 0, 1, 3);
-    
+    fileOpsLayout->addWidget(decodeButton, 6, 0, 1, 3);
+
     leftLayout->addWidget(fileOperationsGroup);
-    
+
     // Batch operations group
     batchGroup = new QGroupBox("Batch Operations");
     QVBoxLayout* batchLayout = new QVBoxLayout(batchGroup);
-    
+
     fileListWidget = new QListWidget();
     fileListWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);
     batchLayout->addWidget(fileListWidget);
-    
+
     QHBoxLayout* batchButtonsLayout = new QHBoxLayout();
     addFilesButton = new QPushButton("Add Files");
     removeFilesButton = new QPushButton("Remove Selected");
@@ -349,7 +415,7 @@ void DriveManagerUI::setupUI() {
     batchButtonsLayout->addWidget(removeFilesButton);
     batchButtonsLayout->addWidget(clearFilesButton);
     batchLayout->addLayout(batchButtonsLayout);
-    
+
     QHBoxLayout* batchOutputLayout = new QHBoxLayout();
     batchOutputLayout->addWidget(new QLabel("Output Directory:"));
     batchOutputDirEdit = new QLineEdit();
@@ -358,76 +424,77 @@ void DriveManagerUI::setupUI() {
     batchOutputLayout->addWidget(batchOutputDirEdit);
     batchOutputLayout->addWidget(batchOutputButton);
     batchLayout->addLayout(batchOutputLayout);
-    
+
     batchEncodeButton = new QPushButton("Batch Encode All");
     batchEncodeButton->setIcon(QIcon::fromTheme("document-save-all"));
     batchLayout->addWidget(batchEncodeButton);
-    
+
     leftLayout->addWidget(batchGroup);
-    
+
     // Right panel
     QWidget* rightPanel = new QWidget();
     QVBoxLayout* rightLayout = new QVBoxLayout(rightPanel);
-    
+
     // Status group
     statusGroup = new QGroupBox("Status");
     QVBoxLayout* statusLayout = new QVBoxLayout(statusGroup);
-    
+
     progressBar = new QProgressBar();
     progressBar->setRange(0, 100);
     statusLayout->addWidget(progressBar);
-    
+
     progressLabel = new QLabel("Ready");
     statusLayout->addWidget(progressLabel);
-    
+
     statusLabel = new QLabel("Status: Idle");
     statusLayout->addWidget(statusLabel);
-    
+
     rightLayout->addWidget(statusGroup);
-    
+
     // Logs group
     logsGroup = new QGroupBox("Logs");
     QVBoxLayout* logsLayout = new QVBoxLayout(logsGroup);
-    
+
     logTextEdit = new QTextEdit();
     logTextEdit->setReadOnly(true);
-    // logTextEdit->setMaximumBlockCount(1000); // Commented out - not available in Qt6
     logsLayout->addWidget(logTextEdit);
-    
+
     clearLogsButton = new QPushButton("Clear Logs");
     logsLayout->addWidget(clearLogsButton);
-    
+
     rightLayout->addWidget(logsGroup);
-    
+
     // Add panels to splitter
     mainSplitter->addWidget(leftPanel);
     mainSplitter->addWidget(rightPanel);
-    mainSplitter->setSizes({600, 600});
-    
+    mainSplitter->setSizes({ 600, 600 });
+
     // Main layout
     QHBoxLayout* mainLayout = new QHBoxLayout(centralWidget);
     mainLayout->addWidget(mainSplitter);
 }
 
 void DriveManagerUI::setupMenuBar() {
-    // Menu setup - using QMainWindow's built-in menuBar
     QMenu* fileMenu = menuBar()->addMenu("&File");
-    fileMenu->addAction("E&xit", this, &QWidget::close);
-    
+
+    fileMenu->addSeparator();
+    fileMenu->addAction("E&xit", this, &QWidget::close, QKeySequence::Quit);
+
     QMenu* toolsMenu = menuBar()->addMenu("&Tools");
-    toolsMenu->addAction("&Clear Logs", this, &DriveManagerUI::clearLogs);
-    
+    toolsMenu->addAction("&Clear Logs", this, &DriveManagerUI::clearLogs, QKeySequence("Ctrl+L"));
+
     QMenu* helpMenu = menuBar()->addMenu("&Help");
-    helpMenu->addAction("&About", [this]() {
-        QMessageBox::about(this, "About", 
+    QAction* aboutAction = helpMenu->addAction("&About");
+    connect(aboutAction, &QAction::triggered, [this]() {
+        QMessageBox::about(this, "About Drive Manager",
             "YouTube Media Storage Drive Manager\n\n"
-            "Encode and decode files using video storage technology\n"
-            "Version 1.0");
-    });
+            "Version 1.0\n\n"
+            "A tool for encoding and decoding files using video storage technology.\n"
+            "Copyright (C) Brandon Li");
+        });
 }
 
 void DriveManagerUI::setupStatusBar() {
-    // Status bar setup - using QMainWindow's built-in statusBar
     permanentStatus = new QLabel("Ready");
     statusBar()->addPermanentWidget(permanentStatus);
 }
@@ -437,13 +504,13 @@ void DriveManagerUI::connectSignals() {
     connect(selectOutputButton, &QPushButton::clicked, this, &DriveManagerUI::selectOutputFile);
     connect(encodeButton, &QPushButton::clicked, this, &DriveManagerUI::startEncode);
     connect(decodeButton, &QPushButton::clicked, this, &DriveManagerUI::startDecode);
-    
+
     connect(addFilesButton, &QPushButton::clicked, this, &DriveManagerUI::selectInputDirectory);
     connect(removeFilesButton, &QPushButton::clicked, this, &DriveManagerUI::removeSelectedFiles);
     connect(clearFilesButton, &QPushButton::clicked, this, &DriveManagerUI::clearFileList);
     connect(batchOutputButton, &QPushButton::clicked, this, &DriveManagerUI::selectOutputDirectory);
     connect(batchEncodeButton, &QPushButton::clicked, this, &DriveManagerUI::startBatchEncode);
-    
+
     connect(clearLogsButton, &QPushButton::clicked, this, &DriveManagerUI::clearLogs);
     connect(passwordVisibilityButton, &QPushButton::clicked, this, &DriveManagerUI::togglePasswordVisibility);
 }
@@ -452,41 +519,122 @@ void DriveManagerUI::togglePasswordVisibility() {
     if (passwordEdit->echoMode() == QLineEdit::Password) {
         passwordEdit->setEchoMode(QLineEdit::Normal);
         passwordVisibilityButton->setText("Hide");
-    } else {
+    }
+    else {
         passwordEdit->setEchoMode(QLineEdit::Password);
         passwordVisibilityButton->setText("Show");
     }
 }
 
 void DriveManagerUI::selectInputFile() {
-    QString fileName = QFileDialog::getOpenFileName(this, "Select Input File", 
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation));
+    // For encoding: accept any file type.
+    // For decoding: accept video files (mp4, mkv).
+    // We allow all files so the user can pick either a data file (to encode)
+    // or a video file (to decode). The operation buttons make the intent clear.
+    QString fileName = QFileDialog::getOpenFileName(this, "Select Input File",
+        QSettings().value(SETTINGS_INPUT_FILE,
+            QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString(),
+        "All Files (*);;Video Files (*.mp4 *.mkv);;Text Files (*.txt *.md *.csv *.json *.xml *.log *.ini *.cfg *.yaml *.yml *.html *.htm *.css *.js *.py *.cpp *.h *.c *.rs *.java *.ts *.sql)");
+
     if (!fileName.isEmpty()) {
         inputFileEdit->setText(fileName);
+
+        updateRecentFiles(fileName, recentInputFiles, SETTINGS_RECENT_FILES);
+        refreshRecentMenus();
+
+        QSettings settings;
+        settings.setValue(SETTINGS_INPUT_FILE, fileName);
+
         logMessage("Selected input file: " + fileName);
     }
 }
 
 void DriveManagerUI::selectOutputFile() {
+    QSettings settings;
+    QString initialDir = settings.value(SETTINGS_OUTPUT_FILE).toString();
+    if (initialDir.isEmpty()) {
+        initialDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    }
+    else {
+        initialDir = QFileInfo(initialDir).path();
+    }
+
+    QString inputFile = inputFileEdit->text();
+    bool isInputVideo = inputFile.endsWith(".mp4", Qt::CaseInsensitive) ||
+        inputFile.endsWith(".mkv", Qt::CaseInsensitive);
+
+    QString filter;
+    QString suggestedFileName;
+    QFileInfo inputInfo(inputFile);
+
+    if (isInputVideo) {
+        // DECODING: Video -> any file type. Default suggestion uses original base name.
+        // Offer common text/data formats but also allow anything.
+        filter = "Text Files (*.txt *.md *.csv *.json *.xml *.log *.ini *.cfg *.yaml *.yml *.html *.htm *.css *.js *.py *.cpp *.h *.c *.rs *.java *.ts *.sql);;All Files (*)";
+        suggestedFileName = inputInfo.path() + "/" + inputInfo.completeBaseName() + ".txt";
+    }
+    else {
+        // ENCODING: any file -> video
+        QString container = containerCombo->currentData().toString();
+        QString extension = (container == "mp4") ? "mp4" : "mkv";
+        filter = QString("%1 Video (*.%2);;All Files (*)").arg(container.toUpper(), extension);
+        suggestedFileName = inputInfo.path() + "/" + inputInfo.completeBaseName() + "." + extension;
+    }
+
+    if (!suggestedFileName.isEmpty() && QFileInfo(suggestedFileName).exists()) {
+        initialDir = suggestedFileName;
+    }
+    else if (!suggestedFileName.isEmpty()) {
+        initialDir = suggestedFileName;
+    }
+
     QString fileName = QFileDialog::getSaveFileName(this, "Select Output File",
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
-        "Video Files (*.mkv *.mp4);;All Files (*)");
+        initialDir, filter);
+
     if (!fileName.isEmpty()) {
+        QFileInfo fileInfo(fileName);
+        QString suffix = fileInfo.suffix().toLower();
+
+        if (!isInputVideo) {
+            // ENCODING: ensure output has a video extension matching the selected container
+            QString container = containerCombo->currentData().toString();
+            QString expectedExtension = (container == "mp4") ? "mp4" : "mkv";
+
+            if (suffix != "mp4" && suffix != "mkv") {
+                fileName = fileInfo.path() + "/" + fileInfo.completeBaseName() + "." + expectedExtension;
+            }
+            else if (suffix != expectedExtension) {
+                fileName = fileInfo.path() + "/" + fileInfo.completeBaseName() + "." + expectedExtension;
+            }
+
+            // Save container preference
+            settings.setValue(SETTINGS_VIDEO_CONTAINER, container);
+        }
+        // DECODING: accept whatever extension the user typed — no forced override.
+
         outputFileEdit->setText(fileName);
+
+        updateRecentFiles(fileName, recentOutputFiles, SETTINGS_RECENT_OUTPUTS);
+        refreshRecentMenus();
+
+        settings.setValue(SETTINGS_OUTPUT_FILE, fileName);
+
         logMessage("Selected output file: " + fileName);
     }
 }
 
 void DriveManagerUI::selectInputDirectory() {
+    // Accept any file type for batch encoding
     QStringList fileNames = QFileDialog::getOpenFileNames(this, "Select Files to Encode",
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation));
-    
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        "All Files (*);;Text Files (*.txt *.md *.csv *.json *.xml *.log *.ini *.cfg *.yaml *.yml *.html *.htm *.css *.js *.py *.cpp *.h *.c *.rs *.java *.ts *.sql);;Video Files (*.mp4 *.mkv)");
+
     for (const QString& fileName : fileNames) {
         if (!fileName.isEmpty() && !fileListWidget->findItems(fileName, Qt::MatchExactly).count()) {
             fileListWidget->addItem(fileName);
         }
     }
-    
+
     if (!fileNames.isEmpty()) {
         logMessage(QString("Added %1 files to batch list").arg(fileNames.size()));
         updateFileList();
@@ -495,9 +643,15 @@ void DriveManagerUI::selectInputDirectory() {
 
 void DriveManagerUI::selectOutputDirectory() {
     QString dirName = QFileDialog::getExistingDirectory(this, "Select Output Directory",
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation));
+        QSettings().value(SETTINGS_BATCH_OUTPUT_DIR,
+            QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString());
+
     if (!dirName.isEmpty()) {
         batchOutputDirEdit->setText(dirName);
+
+        QSettings settings;
+        settings.setValue(SETTINGS_BATCH_OUTPUT_DIR, dirName);
+
         logMessage("Selected output directory: " + dirName);
     }
 }
@@ -507,34 +661,35 @@ void DriveManagerUI::startEncode() {
         QMessageBox::warning(this, "Warning", "An operation is already in progress");
         return;
     }
-    
-    if (!validatePaths()) {
+
+    if (!validatePathsForEncode()) {
         return;
     }
-    
+
     const bool encrypt = encryptCheckBox->isChecked();
     if (encrypt && passwordEdit->text().isEmpty()) {
         QMessageBox::warning(this, "Warning", "Password required when encrypting");
         return;
     }
-    
+
     isOperationRunning = true;
     currentOperation = "Encoding";
     encodeButton->setEnabled(false);
     decodeButton->setEnabled(false);
-    
-    workerThread = std::make_unique<WorkerThread>(WorkerThread::Encode, 
-        inputFileEdit->text(), outputFileEdit->text(), encrypt, passwordEdit->text(), this);
-    
-    connect(workerThread.get(), &WorkerThread::progressUpdated, 
+
+    workerThread = std::make_unique<WorkerThread>(WorkerThread::Encode,
+        inputFileEdit->text(), outputFileEdit->text(), encrypt, passwordEdit->text(),
+        containerCombo->currentData().toString(), this);
+
+    connect(workerThread.get(), &WorkerThread::progressUpdated,
         this, &DriveManagerUI::onProgressUpdated);
-    connect(workerThread.get(), &WorkerThread::statusUpdated, 
+    connect(workerThread.get(), &WorkerThread::statusUpdated,
         this, &DriveManagerUI::onStatusUpdated);
-    connect(workerThread.get(), &WorkerThread::operationCompleted, 
+    connect(workerThread.get(), &WorkerThread::operationCompleted,
         this, &DriveManagerUI::onOperationCompleted);
-    connect(workerThread.get(), &WorkerThread::logMessage, 
+    connect(workerThread.get(), &WorkerThread::logMessage,
         this, &DriveManagerUI::onLogMessage);
-    
+
     workerThread->start();
 }
 
@@ -543,28 +698,29 @@ void DriveManagerUI::startDecode() {
         QMessageBox::warning(this, "Warning", "An operation is already in progress");
         return;
     }
-    
-    if (!validatePaths()) {
+
+    if (!validatePathsForDecode()) {
         return;
     }
-    
+
     isOperationRunning = true;
     currentOperation = "Decoding";
     encodeButton->setEnabled(false);
     decodeButton->setEnabled(false);
-    
-    workerThread = std::make_unique<WorkerThread>(WorkerThread::Decode, 
-        inputFileEdit->text(), outputFileEdit->text(), false, passwordEdit->text(), this);
-    
-    connect(workerThread.get(), &WorkerThread::progressUpdated, 
+
+    workerThread = std::make_unique<WorkerThread>(WorkerThread::Decode,
+        inputFileEdit->text(), outputFileEdit->text(), false, passwordEdit->text(),
+        containerCombo->currentData().toString(), this);
+
+    connect(workerThread.get(), &WorkerThread::progressUpdated,
         this, &DriveManagerUI::onProgressUpdated);
-    connect(workerThread.get(), &WorkerThread::statusUpdated, 
+    connect(workerThread.get(), &WorkerThread::statusUpdated,
         this, &DriveManagerUI::onStatusUpdated);
-    connect(workerThread.get(), &WorkerThread::operationCompleted, 
+    connect(workerThread.get(), &WorkerThread::operationCompleted,
         this, &DriveManagerUI::onOperationCompleted);
-    connect(workerThread.get(), &WorkerThread::logMessage, 
+    connect(workerThread.get(), &WorkerThread::logMessage,
         this, &DriveManagerUI::onLogMessage);
-    
+
     workerThread->start();
 }
 
@@ -573,28 +729,31 @@ void DriveManagerUI::startBatchEncode() {
         QMessageBox::warning(this, "Warning", "An operation is already in progress");
         return;
     }
-    
+
     if (fileListWidget->count() == 0) {
         QMessageBox::warning(this, "Warning", "No files in batch list");
         return;
     }
-    
+
     if (batchOutputDirEdit->text().isEmpty()) {
         QMessageBox::warning(this, "Warning", "Please select an output directory");
         return;
     }
-    
+
     logMessage("Batch encoding not yet implemented - processing first file only");
-    
+
     QListWidgetItem* firstItem = fileListWidget->item(0);
     if (firstItem) {
         QString inputPath = firstItem->text();
         QFileInfo fileInfo(inputPath);
-        QString outputPath = batchOutputDirEdit->text() + "/" + fileInfo.baseName() + ".mkv";
-        
+
+        QString container = containerCombo->currentData().toString();
+        QString extension = (container == "mp4") ? "mp4" : "mkv";
+        QString outputPath = batchOutputDirEdit->text() + "/" + fileInfo.baseName() + "." + extension;
+
         inputFileEdit->setText(inputPath);
         outputFileEdit->setText(outputPath);
-        
+
         startEncode();
     }
 }
@@ -625,16 +784,23 @@ void DriveManagerUI::onOperationCompleted(bool success, const QString& message) 
     isOperationRunning = false;
     encodeButton->setEnabled(true);
     decodeButton->setEnabled(true);
-    
+
     if (success) {
         logMessage("✓ " + message);
         QMessageBox::information(this, "Success", message);
+
+        if (!outputFileEdit->text().isEmpty()) {
+            updateRecentFiles(outputFileEdit->text(), recentOutputFiles, SETTINGS_RECENT_OUTPUTS);
+            refreshRecentMenus();
+        }
+
         passwordEdit->clear();
-    } else {
+    }
+    else {
         logMessage("✗ " + message);
         QMessageBox::critical(this, "Error", message);
     }
-    
+
     resetProgress();
     workerThread.reset();
 }
@@ -670,17 +836,64 @@ bool DriveManagerUI::validatePaths() {
         QMessageBox::warning(this, "Warning", "Please select an input file");
         return false;
     }
-    
+
     if (outputFileEdit->text().isEmpty()) {
         QMessageBox::warning(this, "Warning", "Please select an output file");
         return false;
     }
-    
+
     if (!QFile::exists(inputFileEdit->text())) {
         QMessageBox::warning(this, "Warning", "Input file does not exist");
         return false;
     }
-    
+
+    return true;
+}
+
+bool DriveManagerUI::validatePathsForEncode() {
+    if (!validatePaths()) return false;
+
+    QString inputFile = inputFileEdit->text();
+    QString outputFile = outputFileEdit->text();
+
+    bool inputIsVideo = inputFile.endsWith(".mp4", Qt::CaseInsensitive) ||
+        inputFile.endsWith(".mkv", Qt::CaseInsensitive);
+    bool outputIsVideo = outputFile.endsWith(".mp4", Qt::CaseInsensitive) ||
+        outputFile.endsWith(".mkv", Qt::CaseInsensitive);
+
+    if (inputIsVideo) {
+        QMessageBox::warning(this, "Warning",
+            "The input file is a video. For encoding, please select the data file you want to store.\n"
+            "To decode a video back to a file, use the \"Decode from Video\" button.");
+        return false;
+    }
+
+    if (!outputIsVideo) {
+        QMessageBox::warning(this, "Warning",
+            "The output file must be a video (.mp4 or .mkv).\n"
+            "Please use the output Browse button to select a video output path.");
+        return false;
+    }
+
+    return true;
+}
+
+bool DriveManagerUI::validatePathsForDecode() {
+    if (!validatePaths()) return false;
+
+    QString inputFile = inputFileEdit->text();
+
+    bool inputIsVideo = inputFile.endsWith(".mp4", Qt::CaseInsensitive) ||
+        inputFile.endsWith(".mkv", Qt::CaseInsensitive);
+
+    if (!inputIsVideo) {
+        QMessageBox::warning(this, "Warning",
+            "The input file must be a video (.mp4 or .mkv).\n"
+            "For decoding, please select the encoded video file you want to extract data from.\n"
+            "To encode a data file into a video, use the \"Encode to Video\" button.");
+        return false;
+    }
+
     return true;
 }
 
@@ -694,4 +907,121 @@ void DriveManagerUI::saveSettings() {
     QSettings settings;
     settings.setValue("geometry", saveGeometry());
     settings.setValue("windowState", saveState());
+    settings.setValue(SETTINGS_ENCRYPT_CHECKED, encryptCheckBox->isChecked());
+    settings.setValue(SETTINGS_VIDEO_CONTAINER, containerCombo->currentData().toString());
+
+    if (!inputFileEdit->text().isEmpty()) {
+        settings.setValue(SETTINGS_INPUT_FILE, inputFileEdit->text());
+    }
+    if (!outputFileEdit->text().isEmpty()) {
+        settings.setValue(SETTINGS_OUTPUT_FILE, outputFileEdit->text());
+    }
+    if (!batchOutputDirEdit->text().isEmpty()) {
+        settings.setValue(SETTINGS_BATCH_OUTPUT_DIR, batchOutputDirEdit->text());
+    }
+
+    saveRecentFiles();
+}
+
+void DriveManagerUI::loadRecentFiles() {
+    QSettings settings;
+    recentInputFiles = settings.value(SETTINGS_RECENT_FILES).toStringList();
+    recentOutputFiles = settings.value(SETTINGS_RECENT_OUTPUTS).toStringList();
+
+    recentInputFiles.erase(std::remove_if(recentInputFiles.begin(), recentInputFiles.end(),
+        [](const QString& file) { return !QFile::exists(file); }), recentInputFiles.end());
+    recentOutputFiles.erase(std::remove_if(recentOutputFiles.begin(), recentOutputFiles.end(),
+        [](const QString& file) {
+            QFileInfo info(file);
+            return !info.dir().exists();
+        }), recentOutputFiles.end());
+}
+
+void DriveManagerUI::saveRecentFiles() {
+    QSettings settings;
+    settings.setValue(SETTINGS_RECENT_FILES, recentInputFiles);
+    settings.setValue(SETTINGS_RECENT_OUTPUTS, recentOutputFiles);
+}
+
+void DriveManagerUI::updateRecentFiles(const QString& file, QStringList& list, const QString& settingsKey) {
+    if (file.isEmpty()) return;
+
+    list.removeAll(file);
+    list.prepend(file);
+
+    while (list.size() > MAX_RECENT_FILES) {
+        list.removeLast();
+    }
+
+    QSettings settings;
+    settings.setValue(settingsKey, list);
+}
+
+void DriveManagerUI::setupRecentFilesMenu() {
+    QMenu* fileMenu = menuBar()->actions().first()->menu();
+    if (!fileMenu) return;
+
+    QList<QAction*> actions = fileMenu->actions();
+    for (QAction* action : actions) {
+        if (action->text() == "Recent Input Files" || action->text() == "Recent Output Files" ||
+            action->text() == "Clear Recent Files") {
+            fileMenu->removeAction(action);
+        }
+    }
+
+    fileMenu->addSeparator();
+
+    recentInputMenu = fileMenu->addMenu("Recent Input Files");
+    recentOutputMenu = fileMenu->addMenu("Recent Output Files");
+
+    fileMenu->addSeparator();
+    QAction* clearAction = fileMenu->addAction("Clear Recent Files");
+    connect(clearAction, &QAction::triggered, [this]() {
+        recentInputFiles.clear();
+        recentOutputFiles.clear();
+        saveRecentFiles();
+        refreshRecentMenus();
+        logMessage("Recent files list cleared");
+        });
+
+    refreshRecentMenus();
+}
+
+void DriveManagerUI::refreshRecentMenus() {
+    if (!recentInputMenu || !recentOutputMenu) return;
+
+    recentInputMenu->clear();
+    recentOutputMenu->clear();
+
+    if (recentInputFiles.isEmpty()) {
+        QAction* action = recentInputMenu->addAction("(No recent files)");
+        action->setEnabled(false);
+    }
+    else {
+        for (const QString& file : recentInputFiles) {
+            QAction* action = recentInputMenu->addAction(QFileInfo(file).fileName());
+            action->setToolTip(file);
+            action->setData(file);
+            connect(action, &QAction::triggered, [this, file]() {
+                inputFileEdit->setText(file);
+                logMessage("Restored input file: " + file);
+                });
+        }
+    }
+
+    if (recentOutputFiles.isEmpty()) {
+        QAction* action = recentOutputMenu->addAction("(No recent files)");
+        action->setEnabled(false);
+    }
+    else {
+        for (const QString& file : recentOutputFiles) {
+            QAction* action = recentOutputMenu->addAction(QFileInfo(file).fileName());
+            action->setToolTip(file);
+            action->setData(file);
+            connect(action, &QAction::triggered, [this, file]() {
+                outputFileEdit->setText(file);
+                logMessage("Restored output file: " + file);
+                });
+        }
+    }
 }

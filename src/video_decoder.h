@@ -35,35 +35,31 @@ extern "C" {
 
 class VideoDecoder {
 public:
-    explicit VideoDecoder(const std::string &input_path);
-
+    // Accepts a UTF-8 narrow string path
+    explicit VideoDecoder(const std::string& input_path, const std::string& container = "mkv");
+    // Accepts a wide string path (Windows Unicode filenames)
+    explicit VideoDecoder(const std::wstring& input_path, const std::string& container = "mkv");
     ~VideoDecoder();
 
-    VideoDecoder(const VideoDecoder &) = delete;
+    VideoDecoder(const VideoDecoder&) = delete;
+    VideoDecoder& operator=(const VideoDecoder&) = delete;
+    VideoDecoder(VideoDecoder&&) = delete;
+    VideoDecoder& operator=(VideoDecoder&&) = delete;
 
-    VideoDecoder &operator=(const VideoDecoder &) = delete;
-
-    VideoDecoder(VideoDecoder &&) = delete;
-
-    VideoDecoder &operator=(VideoDecoder &&) = delete;
-
-    std::vector<std::vector<std::byte> > decode_next_frame();
-
-    std::vector<std::vector<std::byte> > decode_all_frames();
+    std::vector<std::vector<std::byte>> decode_next_frame();
+    std::vector<std::vector<std::byte>> decode_all_frames();
 
     [[nodiscard]] int64_t frames_read() const { return frame_index_; }
-
     [[nodiscard]] int64_t total_frames() const;
-
     [[nodiscard]] bool is_eof() const { return eof_; }
 
 private:
-    AVFormatContext *format_ctx_ = nullptr;
-    AVCodecContext *codec_ctx_ = nullptr;
-    AVFrame *frame_ = nullptr;
-    AVFrame *gray_frame_ = nullptr;
-    AVPacket *av_packet_ = nullptr;
-    SwsContext *sws_ctx_ = nullptr;
+    AVFormatContext* format_ctx_ = nullptr;
+    AVCodecContext* codec_ctx_ = nullptr;
+    AVFrame* frame_ = nullptr;
+    AVFrame* gray_frame_ = nullptr;
+    AVPacket* av_packet_ = nullptr;
+    SwsContext* sws_ctx_ = nullptr;
 
     int video_stream_index_ = -1;
     int64_t frame_index_ = 0;
@@ -71,19 +67,14 @@ private:
     bool is_gray8_ = false;
     FrameLayout layout_{};
     std::vector<std::byte> extract_buffer_{};
+    std::string container_format_;
 
-    void init_decoder(const std::string &input_path);
-
+    void init_decoder(const std::string& input_path);
     [[nodiscard]] std::vector<std::byte> extract_data_from_frame() const;
-
-    [[nodiscard]] std::vector<std::vector<std::byte> > extract_packets_from_frame() const;
-
-    void extract_packets_from_buffer(std::vector<std::byte> &accumulated,
-                                     std::vector<std::vector<std::byte> > &out_packets);
-
+    [[nodiscard]] std::vector<std::vector<std::byte>> extract_packets_from_frame() const;
+    void extract_packets_from_buffer(std::vector<std::byte>& accumulated,
+        std::vector<std::vector<std::byte>>& out_packets);
     void prepare_frame_for_extraction();
-
-    [[nodiscard]] std::vector<std::vector<std::byte> > accumulate_frame_and_extract_packets();
-
-    [[nodiscard]] std::vector<std::vector<std::byte> > flush_decoder_and_collect_packets();
+    [[nodiscard]] std::vector<std::vector<std::byte>> accumulate_frame_and_extract_packets();
+    [[nodiscard]] std::vector<std::vector<std::byte>> flush_decoder_and_collect_packets();
 };

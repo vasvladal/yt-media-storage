@@ -230,12 +230,10 @@ bool Decoder::validate_raw_packet_crc(const std::span<const std::byte> packet_da
     }
 
     const uint32_t stored_crc = readU32LE(packet_data, crc_offset);
-    const uint8_t flags = readByte(packet_data, FLAGS_OFF);
-    const HashAlgorithm algo = (flags & UseXXHash) ? HashAlgorithm::XXHash32 : HashAlgorithm::CRC32;
 
     const auto header_span = packet_data.subspan(0, header_size);
     const auto payload_span = packet_data.subspan(header_size, symbol_size);
-    const uint32_t computed_crc = packet_checksum(header_span, payload_span, crc_offset, algo, CRC_SIZE);
+    const uint32_t computed_crc = packet_crc32c(header_span, payload_span, crc_offset, CRC_SIZE);
 
     return stored_crc == computed_crc;
 }
@@ -280,8 +278,7 @@ bool Decoder::validate_packet_crc(const DecodedPacket &packet) {
     std::memcpy(buf.data() + crc_offset, &zero_crc, sizeof(zero_crc));
     const std::span<const std::byte> headerSpan(header.data(), header_size);
     const std::span payloadSpan(packet.payload.data(), packet.payload.size());
-    const HashAlgorithm algo = (packet.header.flags & UseXXHash) ? HashAlgorithm::XXHash32 : HashAlgorithm::CRC32;
-    const uint32_t computed_crc = packet_checksum(headerSpan, payloadSpan, crc_offset, algo, CRC_SIZE);
+    const uint32_t computed_crc = packet_crc32c(headerSpan, payloadSpan, crc_offset, CRC_SIZE);
 
     return computed_crc == packet.header.crc;
 }
@@ -326,9 +323,8 @@ static std::optional<DecodedPacket> parse_and_validate_packet(const std::span<co
 
     crc = readU32LE(packet_data, crc_offset);
     const auto header_span = packet_data.subspan(0, header_size);
-    const HashAlgorithm algo = (flags & UseXXHash) ? HashAlgorithm::XXHash32 : HashAlgorithm::CRC32;
-    if (const auto payload_span = packet_data.subspan(header_size, symbol_size); packet_checksum(header_span,
-            payload_span, crc_offset, algo, CRC_SIZE) != crc) {
+    if (const auto payload_span = packet_data.subspan(header_size, symbol_size); packet_crc32c(header_span,
+            payload_span, crc_offset, CRC_SIZE) != crc) {
         return std::nullopt;
     }
 

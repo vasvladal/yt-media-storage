@@ -44,7 +44,6 @@ enum Flags : uint8_t {
     IsRepairSymbol = 1 << 0,
     LastChunk = 1 << 1,
     Encrypted = 1 << 2,
-    UseXXHash = 1 << 3,
 };
 
 // Header Scheme

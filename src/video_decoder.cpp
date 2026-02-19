@@ -25,8 +25,28 @@
 #include <span>
 #include <stdexcept>
 
-VideoDecoder::VideoDecoder(const std::string &input_path) {
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+VideoDecoder::VideoDecoder(const std::string& input_path, const std::string& container)
+    : container_format_(container) {
     init_decoder(input_path);
+}
+
+VideoDecoder::VideoDecoder(const std::wstring& input_path, const std::string& container)
+    : container_format_(container) {
+#ifdef _WIN32
+    // Convert wide path to UTF-8 string for FFmpeg using Windows API
+    int size = WideCharToMultiByte(CP_UTF8, 0, input_path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string utf8_path(size - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, input_path.c_str(), -1, utf8_path.data(), size, nullptr, nullptr);
+    init_decoder(utf8_path);
+#else
+    init_decoder(std::string(input_path.begin(), input_path.end()));
+#endif
 }
 
 VideoDecoder::~VideoDecoder() {
@@ -38,7 +58,7 @@ VideoDecoder::~VideoDecoder() {
     if (format_ctx_) avformat_close_input(&format_ctx_);
 }
 
-void VideoDecoder::init_decoder(const std::string &input_path) {
+void VideoDecoder::init_decoder(const std::string& input_path) {
     int ret = avformat_open_input(&format_ctx_, input_path.c_str(), nullptr, nullptr);
     if (ret < 0) {
         throw std::runtime_error("Failed to open input file");
@@ -60,8 +80,8 @@ void VideoDecoder::init_decoder(const std::string &input_path) {
         throw std::runtime_error("No video stream found");
     }
 
-    const AVStream *stream = format_ctx_->streams[video_stream_index_];
-    const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    const AVStream* stream = format_ctx_->streams[video_stream_index_];
+    const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!codec) {
         throw std::runtime_error("Failed to find decoder");
     }
@@ -120,13 +140,13 @@ void VideoDecoder::init_decoder(const std::string &input_path) {
 
 int64_t VideoDecoder::total_frames() const {
     if (video_stream_index_ >= 0) {
-        const AVStream *stream = format_ctx_->streams[video_stream_index_];
+        const AVStream* stream = format_ctx_->streams[video_stream_index_];
         if (stream->nb_frames > 0) {
             return stream->nb_frames;
         }
         if (stream->duration > 0 && stream->time_base.den > 0) {
             const double duration_sec = static_cast<double>(stream->duration) *
-                                        av_q2d(stream->time_base);
+                av_q2d(stream->time_base);
             return static_cast<int64_t>(duration_sec * FRAME_FPS);
         }
     }
@@ -134,26 +154,27 @@ int64_t VideoDecoder::total_frames() const {
 }
 
 std::vector<std::byte> VideoDecoder::extract_data_from_frame() const {
-    const auto &projections = get_decoder_projections();
-    const auto &vectors = projections.vectors;
+    const auto& projections = get_decoder_projections();
+    const auto& vectors = projections.vectors;
 
     const int blocks_per_row = layout_.blocks_per_row;
     const int total_blocks = layout_.total_blocks;
     constexpr int blocks_per_byte = 8 / BITS_PER_BLOCK;
 
     const int total_bytes = total_blocks / blocks_per_byte;
-    const uint8_t *src_base;
+    const uint8_t* src_base;
     int src_stride;
     if (is_gray8_) {
         src_base = frame_->data[0];
         src_stride = frame_->linesize[0];
-    } else {
+    }
+    else {
         src_base = gray_frame_->data[0];
         src_stride = gray_frame_->linesize[0];
     }
 
-    std::vector data(total_bytes, std::byte{0});
-    auto *out = reinterpret_cast<uint8_t *>(data.data());
+    std::vector data(total_bytes, std::byte{ 0 });
+    auto* out = reinterpret_cast<uint8_t*>(data.data());
 
 #pragma omp parallel for schedule(static)
     for (int byte_idx = 0; byte_idx < total_bytes; ++byte_idx) {
@@ -168,7 +189,7 @@ std::vector<std::byte> VideoDecoder::extract_data_from_frame() const {
 
             alignas(32) float block_flat[64];
             for (int y = 0; y < 8; ++y) {
-                const uint8_t *row = src_base + (base_y + y) * src_stride + base_x;
+                const uint8_t* row = src_base + (base_y + y) * src_stride + base_x;
                 for (int x = 0; x < 8; ++x)
                     block_flat[y * 8 + x] = static_cast<float>(row[x]);
             }
@@ -191,8 +212,8 @@ std::size_t get_packet_size(const std::span<const std::byte> data) {
     }
     const uint8_t version = static_cast<uint8_t>(data[4]);
     return (version == VERSION_ID_V2)
-               ? (HEADER_SIZE_V2 + SYMBOL_SIZE_BYTES)
-               : (HEADER_SIZE + SYMBOL_SIZE_BYTES);
+        ? (HEADER_SIZE_V2 + SYMBOL_SIZE_BYTES)
+        : (HEADER_SIZE + SYMBOL_SIZE_BYTES);
 }
 
 namespace {
@@ -204,20 +225,20 @@ namespace {
     };
 }
 
-void VideoDecoder::extract_packets_from_buffer(std::vector<std::byte> &accumulated,
-                                               std::vector<std::vector<std::byte> > &out_packets) {
+void VideoDecoder::extract_packets_from_buffer(std::vector<std::byte>& accumulated,
+    std::vector<std::vector<std::byte> >& out_packets) {
     std::size_t offset = 0;
     while (offset + 4 <= accumulated.size()) {
         auto it = std::search(accumulated.begin() + static_cast<std::ptrdiff_t>(offset),
-                              accumulated.end(),
-                              MAGIC_BYTES.begin(), MAGIC_BYTES.end());
+            accumulated.end(),
+            MAGIC_BYTES.begin(), MAGIC_BYTES.end());
         if (it == accumulated.end()) {
             break;
         }
         offset = static_cast<std::size_t>(std::distance(accumulated.begin(), it));
         const std::size_t packet_size = get_packet_size(
             std::span<const std::byte>(accumulated.data() + offset,
-                                       accumulated.size() - offset));
+                accumulated.size() - offset));
         if (offset + packet_size > accumulated.size()) {
             break;
         }
@@ -228,7 +249,7 @@ void VideoDecoder::extract_packets_from_buffer(std::vector<std::byte> &accumulat
         offset += packet_size;
     }
     accumulated.erase(accumulated.begin(),
-                      accumulated.begin() + static_cast<std::ptrdiff_t>(offset));
+        accumulated.begin() + static_cast<std::ptrdiff_t>(offset));
 }
 
 std::vector<std::vector<std::byte> > VideoDecoder::extract_packets_from_frame() const {
@@ -257,7 +278,7 @@ std::vector<std::vector<std::byte> > VideoDecoder::extract_packets_from_frame() 
 void VideoDecoder::prepare_frame_for_extraction() {
     if (!is_gray8_) {
         sws_scale(sws_ctx_, frame_->data, frame_->linesize, 0, frame_->height,
-                  gray_frame_->data, gray_frame_->linesize);
+            gray_frame_->data, gray_frame_->linesize);
     }
     ++frame_index_;
 }
@@ -283,7 +304,7 @@ std::vector<std::vector<std::byte> > VideoDecoder::flush_decoder_and_collect_pac
             throw std::runtime_error("Error receiving frame");
         }
         prepare_frame_for_extraction();
-        for (auto packets = accumulate_frame_and_extract_packets(); auto &p: packets) {
+        for (auto packets = accumulate_frame_and_extract_packets(); auto& p: packets) {
             collected.push_back(std::move(p));
         }
     }
@@ -338,7 +359,7 @@ std::vector<std::vector<std::byte> > VideoDecoder::decode_next_frame() {
 std::vector<std::vector<std::byte> > VideoDecoder::decode_all_frames() {
     std::vector<std::vector<std::byte> > results;
     while (!eof_) {
-        for (auto packets = decode_next_frame(); auto &pkt: packets) {
+        for (auto packets = decode_next_frame(); auto& pkt: packets) {
             results.push_back(std::move(pkt));
         }
     }

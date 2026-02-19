@@ -39,49 +39,44 @@ std::size_t max_packet_bytes_per_frame();
 
 class VideoEncoder {
 public:
-    explicit VideoEncoder(const std::string &output_path);
-
+    // Accepts a UTF-8 narrow string path
+    explicit VideoEncoder(const std::string& output_path, const std::string& container = "mkv");
+    // Accepts a wide string path (Windows Unicode filenames)
+    explicit VideoEncoder(const std::wstring& output_path, const std::string& container = "mkv");
     ~VideoEncoder();
 
-    VideoEncoder(const VideoEncoder &) = delete;
+    VideoEncoder(const VideoEncoder&) = delete;
+    VideoEncoder& operator=(const VideoEncoder&) = delete;
+    VideoEncoder(VideoEncoder&&) = delete;
+    VideoEncoder& operator=(VideoEncoder&&) = delete;
 
-    VideoEncoder &operator=(const VideoEncoder &) = delete;
-
-    VideoEncoder(VideoEncoder &&) = delete;
-
-    VideoEncoder &operator=(VideoEncoder &&) = delete;
-
-    void add_packet(const Packet &packet);
-
-    void encode_packets(const std::vector<Packet> &packets);
-
+    void add_packet(const Packet& packet);
+    void encode_packets(const std::vector<Packet>& packets);
     void finalize();
 
     [[nodiscard]] int64_t frames_written() const { return frame_index; }
-
     [[nodiscard]] static int packets_per_frame();
 
 private:
-    AVFormatContext *format_ctx = nullptr;
-    AVCodecContext *codec_ctx = nullptr;
-    AVStream *stream = nullptr;
-    AVFrame *frame = nullptr;
-    AVPacket *av_packet = nullptr;
-    SwsContext *sws_ctx = nullptr;
+    AVFormatContext* format_ctx = nullptr;
+    AVCodecContext* codec_ctx = nullptr;
+    AVStream* stream = nullptr;
+    AVFrame* frame = nullptr;
+    AVPacket* av_packet = nullptr;
+    SwsContext* sws_ctx = nullptr;
 
     std::vector<uint8_t> gray_buffer;
     std::vector<std::byte> frame_data_buffer;
     FrameLayout layout_{};
     int64_t frame_index = 0;
     bool finalized = false;
+    std::string container_format;
 
-    void init_encoder(const std::string &output_path);
-
-    void embed_data_in_frame(const std::vector<std::byte> &data);
-
+    void init_encoder(const std::string& output_path);
+    void embed_data_in_frame(const std::vector<std::byte>& data);
     void encode_frame();
-
     void flush_encoder() const;
-
     void flush_frame_buffer();
+
+    std::string get_codec_name() const;
 };

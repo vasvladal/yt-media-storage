@@ -20,8 +20,19 @@
 
 #include <algorithm>
 #include <cstring>
-#include <iostream>
 #include <stdexcept>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+// Add missing FFmpeg includes
+extern "C" {
+#include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
+}
 
 FrameLayout compute_frame_layout() {
     FrameLayout layout{};
@@ -39,13 +50,28 @@ std::size_t max_packet_bytes_per_frame() {
     return static_cast<std::size_t>(compute_frame_layout().bytes_per_frame);
 }
 
-VideoEncoder::VideoEncoder(const std::string &output_path) {
+VideoEncoder::VideoEncoder(const std::wstring& output_path, const std::string& container)
+    : container_format(container) {
+#ifdef _WIN32
+    // Convert wide path to UTF-8 string for FFmpeg using Windows API
+    int size = WideCharToMultiByte(CP_UTF8, 0, output_path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string utf8_path(size - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, output_path.c_str(), -1, utf8_path.data(), size, nullptr, nullptr);
+    init_encoder(utf8_path);
+#else
+    init_encoder(std::string(output_path.begin(), output_path.end()));
+#endif
+}
+
+VideoEncoder::VideoEncoder(const std::string& output_path, const std::string& container)
+    : container_format(container) {
     init_encoder(output_path);
 }
 
 VideoEncoder::~VideoEncoder() {
     if (!finalized) {
-        try { finalize(); } catch (...) {
+        try { finalize(); }
+        catch (...) {
         }
     }
     if (sws_ctx) sws_freeContext(sws_ctx);
@@ -58,15 +84,56 @@ VideoEncoder::~VideoEncoder() {
     }
 }
 
-void VideoEncoder::init_encoder(const std::string &output_path) {
-    int ret = avformat_alloc_output_context2(&format_ctx, nullptr, nullptr, output_path.c_str());
-    if (ret < 0 || !format_ctx) {
-        throw std::runtime_error("Failed to create output context");
+std::string VideoEncoder::get_codec_name() const {
+    if (container_format == "mp4") {
+        const AVCodec* codec = avcodec_find_encoder_by_name("libx264");
+        if (codec) {
+            return "libx264";
+        }
+        codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
+        if (codec) {
+            return "mpeg4";
+        }
+        return "libx264";
+    }
+    // For MKV, use FFV1 (lossless)
+    return VIDEO_CODEC;
+}
+
+void VideoEncoder::init_encoder(const std::string& output_path) {
+    // Determine format based on container
+    const char* format_name = nullptr;
+    if (container_format == "mp4") {
+        format_name = "mp4";
+    }
+    else {
+        format_name = "matroska";
     }
 
-    const AVCodec *codec = avcodec_find_encoder_by_name(VIDEO_CODEC.c_str());
+    int ret = avformat_alloc_output_context2(&format_ctx, nullptr, format_name, output_path.c_str());
+    if (ret < 0 || !format_ctx) {
+        // Fallback to extension detection
+        ret = avformat_alloc_output_context2(&format_ctx, nullptr, nullptr, output_path.c_str());
+        if (ret < 0 || !format_ctx) {
+            char error_buffer[256];
+            av_strerror(ret, error_buffer, sizeof(error_buffer));
+            throw std::runtime_error("Failed to create output context: " + std::string(error_buffer));
+        }
+    }
+
+    std::string codec_name = get_codec_name();
+
+    const AVCodec* codec = avcodec_find_encoder_by_name(codec_name.c_str());
     if (!codec) {
-        throw std::runtime_error("Failed to find encoder: " + VIDEO_CODEC);
+        if (container_format == "mp4") {
+            codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
+        }
+        else {
+            codec = avcodec_find_encoder(AV_CODEC_ID_FFV1);
+        }
+        if (!codec) {
+            throw std::runtime_error("Failed to find encoder for " + container_format);
+        }
     }
 
     stream = avformat_new_stream(format_ctx, nullptr);
@@ -81,11 +148,21 @@ void VideoEncoder::init_encoder(const std::string &output_path) {
 
     codec_ctx->width = FRAME_WIDTH;
     codec_ctx->height = FRAME_HEIGHT;
-    codec_ctx->time_base = {1, FRAME_FPS};
-    codec_ctx->framerate = {FRAME_FPS, 1};
-    codec_ctx->gop_size = 30;
+    codec_ctx->time_base = { 1, FRAME_FPS };
+    codec_ctx->framerate = { FRAME_FPS, 1 };
+    codec_ctx->gop_size = 12;
     codec_ctx->max_b_frames = 0;
-    codec_ctx->pix_fmt = AV_PIX_FMT_GRAY8;
+
+    if (container_format == "mp4") {
+        codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+        if (codec_ctx->codec_id == AV_CODEC_ID_H264) {
+            av_opt_set(codec_ctx->priv_data, "preset", "medium", 0);
+            av_opt_set(codec_ctx->priv_data, "crf", "23", 0);
+        }
+    }
+    else {
+        codec_ctx->pix_fmt = AV_PIX_FMT_GRAY8;
+    }
 
     if (format_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
         codec_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -125,7 +202,9 @@ void VideoEncoder::init_encoder(const std::string &output_path) {
     }
 
     if (codec_ctx->pix_fmt != AV_PIX_FMT_GRAY8) {
-        gray_buffer.resize(static_cast<std::size_t>(FRAME_WIDTH) * FRAME_HEIGHT);
+        size_t buffer_size = static_cast<size_t>(FRAME_WIDTH * FRAME_HEIGHT * 3 / 2);
+        gray_buffer.resize(buffer_size);
+
         sws_ctx = sws_getContext(
             FRAME_WIDTH, FRAME_HEIGHT, AV_PIX_FMT_GRAY8,
             FRAME_WIDTH, FRAME_HEIGHT, codec_ctx->pix_fmt,
@@ -141,12 +220,16 @@ void VideoEncoder::init_encoder(const std::string &output_path) {
 
     ret = avio_open(&format_ctx->pb, output_path.c_str(), AVIO_FLAG_WRITE);
     if (ret < 0) {
-        throw std::runtime_error("Failed to open output file");
+        char error_buffer[256];
+        av_strerror(ret, error_buffer, sizeof(error_buffer));
+        throw std::runtime_error("Failed to open output file: " + std::string(error_buffer));
     }
 
     ret = avformat_write_header(format_ctx, nullptr);
     if (ret < 0) {
-        throw std::runtime_error("Failed to write header");
+        char error_buffer[256];
+        av_strerror(ret, error_buffer, sizeof(error_buffer));
+        throw std::runtime_error("Failed to write header: " + std::string(error_buffer));
     }
 }
 
@@ -156,31 +239,21 @@ int VideoEncoder::packets_per_frame() {
     return static_cast<int>(layout.bytes_per_frame / packet_size);
 }
 
-void VideoEncoder::embed_data_in_frame(const std::vector<std::byte> &data) {
-    const auto &blocks = get_precomputed_blocks();
-    const auto &patterns = blocks.patterns;
+void VideoEncoder::embed_data_in_frame(const std::vector<std::byte>& data) {
+    const auto& blocks = get_precomputed_blocks();
+    const auto& patterns = blocks.patterns;
 
     const std::size_t total_bits = data.size() * 8;
     const int total_blocks = layout_.blocks_per_row * layout_.blocks_per_col;
     const int active_blocks = static_cast<int>(
         std::min(static_cast<std::size_t>(total_blocks),
-                 (total_bits + BITS_PER_BLOCK - 1) / BITS_PER_BLOCK));
-    const auto *src = reinterpret_cast<const uint8_t *>(data.data());
+            (total_bits + BITS_PER_BLOCK - 1) / BITS_PER_BLOCK));
+    const auto* src = reinterpret_cast<const uint8_t*>(data.data());
     const int blocks_per_row = layout_.blocks_per_row;
 
-    uint8_t *dst_base;
-    int dst_stride;
-    if (sws_ctx) {
-        dst_base = gray_buffer.data();
-        dst_stride = FRAME_WIDTH;
-        std::memset(dst_base, 128, gray_buffer.size());
-    } else {
-        av_frame_make_writable(frame);
-        dst_base = frame->data[0];
-        dst_stride = frame->linesize[0];
-        for (int y = 0; y < FRAME_HEIGHT; ++y)
-            std::memset(dst_base + y * dst_stride, 128, FRAME_WIDTH);
-    }
+    std::vector<uint8_t> gray_frame_buffer(FRAME_WIDTH * FRAME_HEIGHT, 128);
+    uint8_t* gray_data = gray_frame_buffer.data();
+    int gray_stride = FRAME_WIDTH;
 
 #pragma omp parallel for schedule(static)
     for (int block_idx = 0; block_idx < active_blocks; ++block_idx) {
@@ -203,18 +276,52 @@ void VideoEncoder::embed_data_in_frame(const std::vector<std::byte> &data) {
         const int bits_extracted = static_cast<int>(bit_end - bit_start);
         pattern <<= (BITS_PER_BLOCK - bits_extracted);
 
-        const auto &block = patterns[pattern];
+        const auto& block = patterns[pattern];
         for (int y = 0; y < 8; ++y) {
-            std::memcpy(dst_base + (base_y + y) * dst_stride + base_x,
-                        block[y], 8);
+            std::memcpy(gray_data + (base_y + y) * gray_stride + base_x,
+                block[y], 8);
         }
     }
 
     if (sws_ctx) {
-        const uint8_t *src_data[1] = {gray_buffer.data()};
-        constexpr int src_linesize[1] = {FRAME_WIDTH};
+        const uint8_t* src_data[1] = { gray_data };
+        const int src_linesize[1] = { gray_stride };
+
+        uint8_t* dst_data[4] = { nullptr };
+        int dst_linesize[4] = { 0 };
+
+        dst_data[0] = gray_buffer.data();
+        dst_linesize[0] = FRAME_WIDTH;
+
+        if (codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P) {
+            dst_data[1] = gray_buffer.data() + FRAME_WIDTH * FRAME_HEIGHT;
+            dst_linesize[1] = FRAME_WIDTH / 2;
+            dst_data[2] = gray_buffer.data() + FRAME_WIDTH * FRAME_HEIGHT * 5 / 4;
+            dst_linesize[2] = FRAME_WIDTH / 2;
+        }
+
         sws_scale(sws_ctx, src_data, src_linesize, 0, FRAME_HEIGHT,
-                  frame->data, frame->linesize);
+            dst_data, dst_linesize);
+
+        av_frame_make_writable(frame);
+
+        int y_plane_size = FRAME_WIDTH * FRAME_HEIGHT;
+        std::memcpy(frame->data[0], dst_data[0], y_plane_size);
+
+        if (codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P && frame->data[1] && frame->data[2]) {
+            int uv_plane_size = FRAME_WIDTH * FRAME_HEIGHT / 4;
+            std::memcpy(frame->data[1], dst_data[1], uv_plane_size);
+            std::memcpy(frame->data[2], dst_data[2], uv_plane_size);
+        }
+    }
+    else {
+        av_frame_make_writable(frame);
+        uint8_t* dst = frame->data[0];
+        int dst_stride = frame->linesize[0];
+
+        for (int y = 0; y < FRAME_HEIGHT; ++y) {
+            std::memcpy(dst + y * dst_stride, gray_data + y * gray_stride, FRAME_WIDTH);
+        }
     }
 }
 
@@ -252,7 +359,7 @@ void VideoEncoder::encode_frame() {
     }
 }
 
-void VideoEncoder::add_packet(const Packet &packet) {
+void VideoEncoder::add_packet(const Packet& packet) {
     if (finalized) {
         throw std::runtime_error("Encoder already finalized");
     }
@@ -263,12 +370,12 @@ void VideoEncoder::add_packet(const Packet &packet) {
     }
 
     frame_data_buffer.insert(frame_data_buffer.end(),
-                             packet.bytes.begin(),
-                             packet.bytes.end());
+        packet.bytes.begin(),
+        packet.bytes.end());
 }
 
-void VideoEncoder::encode_packets(const std::vector<Packet> &packets) {
-    for (const auto &pkt: packets) {
+void VideoEncoder::encode_packets(const std::vector<Packet>& packets) {
+    for (const auto& pkt : packets) {
         add_packet(pkt);
     }
 }

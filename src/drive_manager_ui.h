@@ -37,10 +37,15 @@
 #include <QStatusBar>
 #include <QTimer>
 #include <QThread>
+#include <QSettings>
+#include <QStringList>
+#include <QMenu>
+#include <QAction>
 
 #include <memory>
 #include <string>
 #include <filesystem>
+#include <algorithm>
 
 class WorkerThread : public QThread {
     Q_OBJECT
@@ -52,7 +57,8 @@ public:
     };
 
     WorkerThread(Operation op, const QString& input, const QString& output,
-                 bool encrypt = false, const QString& password = QString(), QObject* parent = nullptr);
+        bool encrypt = false, const QString& password = QString(),
+        const QString& container = "mkv", QObject* parent = nullptr);
 
 signals:
     void progressUpdated(int percentage);
@@ -69,6 +75,7 @@ private:
     QString outputPath;
     bool encrypt;
     QString password;
+    QString container;
 };
 
 class DriveManagerUI : public QMainWindow {
@@ -106,11 +113,20 @@ private:
     void loadSettings();
     void saveSettings();
     bool validatePaths();
+    bool validatePathsForEncode();
+    bool validatePathsForDecode();
+
+    // Recent files management
+    void loadRecentFiles();
+    void saveRecentFiles();
+    void updateRecentFiles(const QString& file, QStringList& list, const QString& settingsKey);
+    void setupRecentFilesMenu();
+    void refreshRecentMenus();
 
     // UI Components
     QWidget* centralWidget;
     QSplitter* mainSplitter;
-    
+
     // Left panel - File operations
     QGroupBox* fileOperationsGroup;
     QLineEdit* inputFileEdit;
@@ -122,7 +138,10 @@ private:
     QPushButton* passwordVisibilityButton;
     QPushButton* encodeButton;
     QPushButton* decodeButton;
-    
+
+    // Container selection
+    QComboBox* containerCombo;
+
     // Batch operations
     QGroupBox* batchGroup;
     QListWidget* fileListWidget;
@@ -132,28 +151,44 @@ private:
     QPushButton* batchEncodeButton;
     QLineEdit* batchOutputDirEdit;
     QPushButton* batchOutputButton;
-    
+
     // Right panel - Status and logs
     QGroupBox* statusGroup;
     QProgressBar* progressBar;
     QLabel* statusLabel;
     QLabel* progressLabel;
-    
+
     QGroupBox* logsGroup;
     QTextEdit* logTextEdit;
     QPushButton* clearLogsButton;
-    
+
     // Menu and status bar
     QLabel* permanentStatus;
-    
+    QMenu* recentInputMenu;
+    QMenu* recentOutputMenu;
+
     // Settings
     QComboBox* qualityCombo;
     QComboBox* codecCombo;
-    
+
     // Worker thread
     std::unique_ptr<WorkerThread> workerThread;
-    
+
     // State
     bool isOperationRunning;
     QString currentOperation;
+
+    // Recent files
+    QStringList recentInputFiles;
+    QStringList recentOutputFiles;
+
+    // Settings keys
+    static constexpr const char* SETTINGS_INPUT_FILE = "lastInputFile";
+    static constexpr const char* SETTINGS_OUTPUT_FILE = "lastOutputFile";
+    static constexpr const char* SETTINGS_BATCH_OUTPUT_DIR = "lastBatchOutputDir";
+    static constexpr const char* SETTINGS_ENCRYPT_CHECKED = "encryptChecked";
+    static constexpr const char* SETTINGS_RECENT_FILES = "recentFiles";
+    static constexpr const char* SETTINGS_RECENT_OUTPUTS = "recentOutputs";
+    static constexpr const char* SETTINGS_VIDEO_CONTAINER = "videoContainer";
+    static constexpr int MAX_RECENT_FILES = 10;
 };
